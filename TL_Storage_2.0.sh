@@ -1,93 +1,96 @@
 #!/bin/zsh
 
-# --- 1. SETUP & LOGGING ---
+# --- [STEP 1: INITIALIZATION] ---
+echo "--- [PHASE 1: ENVIRONMENT SETUP] ---"
 LOG_FILE="/var/log/outlook_cleanup.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "--- Starting Outlook Cleanup: $(date) ---"
+echo "Verification: Logic check started at $(date)"
 
-# Identity Check
+# Identify the logged-in user
 currentUser=$(/usr/bin/stat -f "%Su" /dev/console)
 currentUserID=$(/usr/bin/id -u "$currentUser")
 JH="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
 
-if [[ "$currentUser" == "root" ]]; then
-    echo "Error: Running at login window or no user logged in."
-    exit 1
+# Safety Check
+if [[ "$currentUser" == "root" || -z "$currentUser" ]]; then
+    echo "Status: ERROR. No user session detected. Aborting safely."
+    exit 0
 fi
 
 # Define Paths
 outlookRoot="/Users/$currentUser/Library/Group Containers/UBF8T346G9.Office/Outlook"
-legacyPath="$outlookRoot/Outlook 15 Profiles/Main Profile"
 newOutlookPath="$outlookRoot/Outlook 15 Profiles"
 BACKUP_BASE="/Users/$currentUser/.Outlook_Backup_Data"
 
-# --- 2. USER CONSENT ---
-RESPONSE=$("$JH" -windowType utility -title "Maintenance" -heading "Outlook Cleanup" \
--description "This will reset Outlook to save space. Your data will be backed up. Proceed?" \
--button1 "Accept" -button2 "Cancel" -defaultButton 1)
+# --- [STEP 2: USER INTERACTION & BACKUP] ---
+echo "--- [PHASE 2: USER CONSENT & BACKUP] ---"
+RESPONSE=$("$JH" -windowType utility -title "IT Maintenance" -heading "Outlook Disk Cleanup" \
+-description "Outlook will be reset to free up disk space. Your data will be backed up temporarily. Proceed?" \
+-button1 "Accept" -button2 "Cancel" -defaultButton 1 -icon /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ToolbarUtilitiesFolderIcon.icns)
 
 if [[ "$RESPONSE" != "0" ]]; then
-    echo "User cancelled."
+    echo "Status: CANCELLED. User opted out of maintenance."
     exit 0
 fi
 
-# --- 3. EXECUTION ---
+echo "Action: Closing Outlook and creating temporary backup..."
 /usr/bin/pkill -u "$currentUser" -x "Microsoft Outlook"
 /bin/sleep 2
 
-# Create Backup
 /bin/mkdir -p "$BACKUP_BASE"
+/usr/sbin/chown "$currentUser" "$BACKUP_BASE"
 
-if [[ -d "$legacyPath" ]]; then
-    /bin/mv "$legacyPath" "$BACKUP_BASE/Legacy_Backup"
-    echo "Legacy data moved to backup."
-fi
-
-# Note: Moving the whole 'Profiles' folder for New Outlook
 if [[ -d "$newOutlookPath" ]]; then
-    /bin/mv "$newOutlookPath" "$BACKUP_BASE/New_Backup"
-    echo "New Outlook data moved to backup."
+    /bin/mv "$newOutlookPath" "$BACKUP_BASE/Profiles_Backup"
+    echo "Status: SUCCESS. Profiles moved to $BACKUP_BASE."
 fi
 
-# Open Outlook to let it generate fresh (empty) files
 /usr/bin/sudo -u "$currentUser" /usr/bin/open -a "Microsoft Outlook"
 
-# --- 4. VERIFICATION & RESTORE ---
+# --- [STEP 3: VERIFICATION & PURGE] ---
+echo "--- [PHASE 3: VERIFICATION & DATA PURGE] ---"
 FINAL_CHECK=$("$JH" -windowType utility -title "Verification" \
--description "Is Outlook working? 'YES' deletes backups forever. 'NO' restores your old data." \
+-description "Is Outlook working correctly? 
+
+Selecting YES will PERMANENTLY delete your old data to save space. 
+Selecting NO will restore your previous data immediately." \
 -button1 "Yes" -button2 "No" -defaultButton 1)
 
 if [[ "$FINAL_CHECK" == "0" ]]; then
-    echo "Cleanup confirmed. Deleting backup..."
+    echo "Action: User confirmed success. Calculating space savings..."
+    
+    if [[ -d "$BACKUP_BASE/Profiles_Backup" ]]; then
+        RECLAIMED_SIZE=$(du -sh "$BACKUP_BASE/Profiles_Backup" | awk '{print $1}')
+    else
+        RECLAIMED_SIZE="0B"
+    fi
+
     /bin/rm -rf "$BACKUP_BASE"
+
+    echo "--- Purge Results ---"
+    echo "Status: SUCCESS. Outlook cache permanently removed."
+    echo "Summary: Reclaimed $RECLAIMED_SIZE of disk space."
+    
 else
-    echo "Issue reported. Starting Restore..."
+    echo "Action: User reported issue. Restoring data..."
     /usr/bin/pkill -u "$currentUser" -x "Microsoft Outlook"
     /bin/sleep 2
-
-    # CRITICAL: Remove the NEW empty folders before moving the OLD ones back
-    /bin/rm -rf "$legacyPath"
     /bin/rm -rf "$newOutlookPath"
 
-    # Restore Legacy
-    if [[ -d "$BACKUP_BASE/Legacy_Backup" ]]; then
-        /bin/mkdir -p "$(dirname "$legacyPath")"
-        /bin/mv "$BACKUP_BASE/Legacy_Backup" "$legacyPath"
+    if [[ -d "$BACKUP_BASE/Profiles_Backup" ]]; then
+        /bin/mv "$BACKUP_BASE/Profiles_Backup" "$newOutlookPath"
+        echo "Status: RESTORED. Original data returned to library."
     fi
 
-    # Restore New Outlook
-    if [[ -d "$BACKUP_BASE/New_Backup" ]]; then
-        /bin/mkdir -p "$(dirname "$newOutlookPath")"
-        /bin/mv "$BACKUP_BASE/New_Backup" "$newOutlookPath"
-    fi
-
-    # FIX PERMISSIONS: Ensure the user owns the restored files
     /usr/sbin/chown -R "$currentUser" "$outlookRoot"
-    
     /usr/bin/sudo -u "$currentUser" /usr/bin/open -a "Microsoft Outlook"
-    echo "Restore complete."
 fi
 
-echo "--- Finished: $(date) ---"
+# --- [STEP 4: FINALIZATION & INVENTORY] ---
+echo "--- [PHASE 4: INVENTORY UPDATE & CLEANUP] ---"
+echo "Action: Updating Jamf Inventory to clear local storage alerts..."
+/usr/local/bin/jamf recon
+echo "Status: COMPLETE. Inventory updated at $(date)."
+
 exit 0
