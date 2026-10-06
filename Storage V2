@@ -1,0 +1,406 @@
+#!/bin/zsh
+#
+# Outlook Profile Reset - Jamf Pro Self Service policy script
+# v2.2 - 2026-10-06
+#
+# Frees disk space used by Outlook by moving the profile to a backup,
+# launching Outlook with a fresh profile, and only deleting the backup
+# after the user has checked Outlook and confirmed TWICE.
+# Any other path (problem, timeout, cancel, error) restores the original data.
+#
+# v2.2: closes ALL Outlook processes and confirms they are gone before the
+# profile is moved (prevents Outlook from writing its data back).
+# v2.1: move, skeleton, reopen and restore use the same commands as the
+# original tested script. The size is measured on
+# the backup AFTER it is moved out of Outlook's container, as the original did.
+#
+# Jamf parameters:
+#   $4  Run inventory update at the end (yes/no) .......... default: yes
+#       Set to "no" if the policy already has "Update Inventory" enabled
+#       in its Maintenance payload, so recon does not run twice.
+#   $5  Seconds to wait for the user's verification ....... default: 3600
+#       If nobody answers, the data is RESTORED, never deleted.
+
+RUN_RECON="${4:-yes}"
+VERIFY_TIMEOUT="${5:-3600}"
+
+LOG_FILE="/var/log/outlook_cleanup.log"
+STATUS_PLIST="/Library/Management/OutlookReset/status.plist"
+JH="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+ICONS="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources"
+ICON_PROGRESS="$ICONS/ToolbarUtilitiesFolderIcon.icns"
+ICON_INFO="$ICONS/AlertNoteIcon.icns"
+ICON_CAUTION="$ICONS/AlertCautionIcon.icns"   # yellow warning triangle
+ICON_STOP="$ICONS/AlertStopIcon.icns"         # red stop sign
+TITLE="IT Maintenance - Outlook Cleanup"
+TOTAL_STEPS=6
+
+START_EPOCH=$(/bin/date +%s)
+OUTCOME="UNKNOWN"
+backupKB=0
+reclaimedKB=0
+freeBeforeKB=0
+freeAfterKB=0
+progressPID=""
+currentUser=""
+
+# ---------------------------------------------------------------------------
+# Logging helpers - everything goes to Jamf (stdout) AND the local log file
+# ---------------------------------------------------------------------------
+raw()    { print -r -- "$*" | /usr/bin/tee -a "$LOG_FILE"; }
+log()    { raw "$(/bin/date '+%H:%M:%S')  $*"; }
+step()   { raw ""; log "[$1/$TOTAL_STEPS] $2"; }
+detail() { raw "          $*"; }
+
+human() {   # KB -> "96.2 GB"
+    /usr/bin/awk -v kb="${1:-0}" 'BEGIN { split("KB MB GB TB", u, " "); i = 1
+        while (kb >= 1024 && i < 4) { kb /= 1024; i++ }
+        printf "%.1f %s", kb, u[i] }'
+}
+
+free_kb() { /bin/df -k "/Users/${currentUser}" 2>/dev/null | /usr/bin/awk 'NR==2 {print $4}'; }
+
+# du errors go to the local log so permission problems are visible there
+size_kb() { /usr/bin/du -sk "$1" 2>>"$LOG_FILE" | /usr/bin/awk '{print $1}'; }
+
+# ---------------------------------------------------------------------------
+# User-facing helpers
+# ---------------------------------------------------------------------------
+show_progress() {   # show_progress "<heading>" "<description>"  (no buttons, stays until replaced)
+    hide_progress
+    "$JH" -windowType utility -title "$TITLE" -heading "$1" -description "$2" \
+        -icon "$ICON_PROGRESS" &>/dev/null &
+    progressPID=$!
+}
+
+hide_progress() {
+    [[ -n "$progressPID" ]] && kill "$progressPID" 2>/dev/null
+    progressPID=""
+}
+
+notify() {   # notify "<heading>" "<description>" "<icon>"  (non-blocking, closes after 2 min)
+    "$JH" -windowType utility -title "$TITLE" -heading "$1" -description "$2" \
+        -icon "$3" -button1 "OK" -defaultButton 1 -timeout 120 &>/dev/null &
+}
+
+outlook_running() { /usr/bin/pgrep -u "$currentUser" -x "Microsoft Outlook" >/dev/null 2>&1; }
+
+# Close ALL Outlook processes (main app + helpers) and confirm they are gone.
+# If any part of Outlook is still running when the profile is moved, it can
+# write its open data straight back into the fresh profile (instant refill,
+# no space freed). Returns 0 only when no Outlook process is left.
+OUTLOOK_PATTERN="/Applications/Microsoft Outlook.app/"
+
+outlook_procs() { /usr/bin/pgrep -u "$currentUser" -f "$OUTLOOK_PATTERN"; }
+
+log_outlook_procs() {
+    local p
+    for p in $(outlook_procs); do
+        detail "  still running: PID $p $(/bin/ps -o comm= -p "$p" 2>/dev/null | /usr/bin/awk -F/ '{print $NF}')"
+    done
+}
+
+quit_outlook() {
+    local count=$(outlook_procs | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+    detail "Outlook processes running: $count"
+    (( count == 0 )) && return 0
+
+    /usr/bin/pkill -u "$currentUser" -f "$OUTLOOK_PATTERN"
+    for i in {1..20}; do
+        outlook_procs >/dev/null || { /bin/sleep 2; return 0; }
+        /bin/sleep 1
+    done
+
+    detail "Outlook did not quit in 20s. Forcing it to close."
+    /usr/bin/pkill -9 -u "$currentUser" -f "$OUTLOOK_PATTERN"
+    /bin/sleep 3
+    if outlook_procs >/dev/null; then
+        log_outlook_procs
+        return 1
+    fi
+    return 0
+}
+
+open_outlook() {
+    /usr/bin/sudo -u "$currentUser" /usr/bin/open -a "Microsoft Outlook"
+}
+
+# ---------------------------------------------------------------------------
+# Finish: status file, optional recon, and a clean summary block at the end
+# ---------------------------------------------------------------------------
+finish() {   # finish <OUTCOME> <exit code>
+    OUTCOME="$1"
+    local code="${2:-0}"
+    hide_progress
+    freeAfterKB=$(free_kb)
+
+    # Status file for a Jamf Extension Attribute (fleet-wide reporting)
+    /bin/mkdir -p "${STATUS_PLIST:h}"
+    /usr/bin/defaults write "$STATUS_PLIST" LastRun -string "$(/bin/date '+%Y-%m-%d %H:%M')"
+    /usr/bin/defaults write "$STATUS_PLIST" Outcome -string "$OUTCOME"
+    /usr/bin/defaults write "$STATUS_PLIST" ReclaimedGB -string "$(( reclaimedKB / 1048576 ))"
+
+    if [[ "$RUN_RECON" == "yes" && "$OUTCOME" == (PURGED|RESTORED|FAILED) ]]; then
+        step 6 "Inventory update"
+        # Full recon output goes to the local log only, not to the Jamf policy log
+        if /usr/local/bin/jamf recon >>"$LOG_FILE" 2>&1; then
+            detail "Inventory submitted to Jamf Pro."
+        else
+            detail "WARNING: recon failed - details in $LOG_FILE"
+        fi
+    fi
+
+    local dur=$(( $(/bin/date +%s) - START_EPOCH ))
+    raw ""
+    raw "==================== RESULT ===================="
+    raw " Outcome ............. $OUTCOME"
+    raw " User ................ ${currentUser:-none}"
+    raw " Old Outlook data .... $(human $backupKB)"
+    raw " Space reclaimed ..... $(human $reclaimedKB)"
+    raw " Free disk before .... $(human $freeBeforeKB)"
+    raw " Free disk after ..... $(human $freeAfterKB)"
+    raw " Duration ............ $(( dur / 60 ))m $(( dur % 60 ))s"
+    raw "================================================"
+    exit "$code"
+}
+
+trap 'hide_progress' EXIT
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+currentUser=$(/usr/bin/stat -f "%Su" /dev/console)
+
+raw ""
+raw "================================================"
+raw " OUTLOOK PROFILE RESET v2.2  $(/bin/date '+%Y-%m-%d %H:%M:%S %Z')"
+raw " Computer: $(/usr/sbin/scutil --get ComputerName 2>/dev/null)"
+raw "================================================"
+
+# --- [1] PRE-CHECKS --------------------------------------------------------
+step 1 "Pre-checks"
+
+if [[ -z "$currentUser" || "$currentUser" == "root" || "$currentUser" == "loginwindow" ]]; then
+    detail "No user logged in. Nothing was changed."
+    finish "ABORTED" 0
+fi
+currentUserID=$(/usr/bin/id -u "$currentUser")
+detail "User: $currentUser (UID $currentUserID)"
+
+outlookRoot="/Users/$currentUser/Library/Group Containers/UBF8T346G9.Office/Outlook"
+newOutlookPath="$outlookRoot/Outlook 15 Profiles"
+legacyProfilePath="$newOutlookPath/Main Profile"
+BACKUP_BASE="/Users/$currentUser/.Outlook_Backup_Data"
+BACKUP_FOLDER="$BACKUP_BASE/Profiles_Backup"
+
+if [[ ! -d "$newOutlookPath" ]]; then
+    detail "No Outlook profile folder found. Nothing to clean."
+    finish "NOTHING_TO_DO" 0
+fi
+
+# Never delete a backup left by a previous interrupted run: it may be the user's only copy
+if [[ -e "$BACKUP_FOLDER" ]]; then
+    detail "WARNING: a backup from a previous run already exists:"
+    detail "$BACKUP_FOLDER ($(human $(size_kb "$BACKUP_FOLDER")))"
+    detail "It was NOT touched. Restore or remove it manually, then re-run."
+    notify "� A previous Outlook cleanup was not finished" "Your Outlook data is safe, but the cleanup cannot continue.
+
+Please contact IT so they can complete it." "$ICON_STOP"
+    finish "ABORTED" 1
+fi
+
+freeBeforeKB=$(free_kb)
+detail "Free disk: $(human $freeBeforeKB)"
+
+# --- [2] USER CONSENT ------------------------------------------------------
+step 2 "User consent"
+
+consent=$("$JH" -windowType utility -title "$TITLE" -icon "$ICON_INFO" \
+    -heading "Outlook Disk Cleanup" \
+    -description "IT needs to reset Outlook to free up disk space.
+
+What will happen:
+ 1. Outlook will close. Save any email drafts first.
+ 2. Your current Outlook data will be set aside as a backup.
+ 3. Outlook will reopen with a fresh profile and download your mailbox from the server.
+ 4. You will be asked to CHECK Outlook. Your old data is deleted only after you confirm everything works.
+
+If anything goes wrong, your old data is restored. This takes about 5-10 minutes." \
+    -button1 "Start" -button2 "Not now" -defaultButton 1 -cancelButton 2)
+
+if [[ "$consent" != "0" ]]; then
+    detail "User chose \"Not now\". Nothing was changed."
+    finish "CANCELLED" 0
+fi
+detail "User accepted."
+
+# --- [3] BACKUP & RESET ----------------------------------------------------
+step 3 "Backup & reset"
+
+show_progress "Step 1 of 3 - Closing Outlook" "Outlook is being closed.
+
+Please do not open Outlook until this window disappears."
+if quit_outlook; then
+    detail "Outlook fully closed (no Outlook processes left)."
+else
+    detail "ERROR: Outlook could not be fully closed. Nothing was moved."
+    hide_progress
+    notify "Outlook cleanup could not run" "Outlook could not be closed completely, so nothing was changed. Your Outlook data is safe.
+
+Please restart your Mac and try again from Self Service." "$ICON_STOP"
+    finish "FAILED" 1
+fi
+
+show_progress "Step 2 of 3 - Backing up your Outlook data" "Your Outlook data is being moved to a temporary backup.
+
+Nothing is being deleted. Please wait."
+/bin/mkdir -p "$BACKUP_BASE"
+/usr/sbin/chown "$currentUser" "$BACKUP_BASE"
+if /bin/mv "$newOutlookPath" "$BACKUP_FOLDER"; then
+    backupKB=$(size_kb "$BACKUP_FOLDER")
+    detail "Profile moved to backup: $BACKUP_FOLDER"
+    detail "Old Outlook data: $(human $backupKB)"
+else
+    detail "ERROR: could not move the profile to the backup. Original data left in place."
+    hide_progress
+    open_outlook
+    notify "Outlook cleanup could not run" "Nothing was changed and your Outlook data is safe.
+
+Please contact IT." "$ICON_STOP"
+    finish "FAILED" 1
+fi
+
+show_progress "Step 3 of 3 - Opening a fresh Outlook" "Outlook will open in a moment.
+
+Sign in if asked. Your emails will start downloading from the server."
+# Pre-create the 'Main Profile' skeleton so Outlook launches correctly
+/bin/mkdir -p "$legacyProfilePath"
+/usr/sbin/chown -R "$currentUser" "$newOutlookPath"
+detail "Fresh profile skeleton created."
+
+open_outlook
+for i in {1..60}; do
+    outlook_running && break
+    /bin/sleep 1
+done
+if outlook_running; then
+    detail "Outlook launched with the fresh profile."
+else
+    detail "WARNING: Outlook did not start within 60 seconds."
+fi
+/bin/sleep 15   # let the Outlook window appear before asking the user
+hide_progress
+
+# --- [4] USER VERIFICATION -------------------------------------------------
+step 4 "User verification"
+
+decision=""
+while [[ -z "$decision" ]]; do
+    askStart=$(/bin/date +%s)
+    check=$("$JH" -windowType utility -windowPosition ur -title "$TITLE" -icon "$ICON_CAUTION" \
+        -heading "⚠️ ACTION REQUIRED: Please check Outlook now" \
+        -description "Your old Outlook data ($(human $backupKB)) has been moved to a temporary backup. It is NOT deleted yet.
+
+In Outlook, please check that:
+ ✔ You are signed in to your account
+ ✔ Your Inbox shows recent emails
+    (older emails can take a while to download)
+ ✔ Your Calendar shows your meetings
+ ✔ You can send an email (send one to yourself)
+
+Take your time and keep this window open while you check.
+If there is no answer before the timer ends, your old data will be restored automatically." \
+        -button1 "All good" -button2 "Problem" -defaultButton 2 \
+        -timeout "$VERIFY_TIMEOUT" -countdown -alignCountdown right)
+
+    if [[ "$check" != "0" ]]; then
+        if (( $(/bin/date +%s) - askStart >= VERIFY_TIMEOUT - 2 )); then
+            detail "No answer within $(( VERIFY_TIMEOUT / 60 )) min. Restoring (safe default)."
+        else
+            detail "User reported a PROBLEM with Outlook."
+        fi
+        decision="restore"
+        break
+    fi
+    detail "User reported Outlook works."
+
+    confirm=$("$JH" -windowType utility -windowPosition ur -title "$TITLE" -icon "$ICON_STOP" \
+        -heading "� FINAL STEP: Permanently delete your old Outlook data?" \
+        -description "You confirmed that Outlook works correctly.
+
+Clicking DELETE will permanently erase your old Outlook backup ($(human $backupKB)).
+
+⚠️ THIS CANNOT BE UNDONE. IT will not be able to recover it.
+
+If you are not completely sure, click \"Keep checking\" and take another look at Outlook." \
+        -button1 "Delete" -button2 "Keep checking" -defaultButton 2 -cancelButton 2)
+
+    if [[ "$confirm" == "0" ]]; then
+        detail "User confirmed permanent deletion."
+        decision="purge"
+    else
+        detail "User chose to keep checking."
+    fi
+done
+
+# --- [5] PURGE or RESTORE --------------------------------------------------
+if [[ "$decision" == "purge" ]]; then
+    step 5 "Purge old data"
+    show_progress "Freeing up disk space..." "Deleting your old Outlook backup ($(human $backupKB)).
+
+This can take a few minutes. You can keep using Outlook."
+    /bin/rm -rf "$BACKUP_BASE"
+    hide_progress
+
+    if [[ -e "$BACKUP_BASE" ]]; then
+        detail "ERROR: backup could not be fully deleted: $BACKUP_BASE"
+        reclaimedKB=$(( backupKB - $(size_kb "$BACKUP_BASE") ))
+        finish "FAILED" 1
+    fi
+
+    reclaimedKB=$backupKB
+    detail "Backup deleted. Reclaimed $(human $reclaimedKB)."
+    notify "✅ Outlook cleanup complete" "$(human $reclaimedKB) of disk space has been freed.
+
+Your emails will keep downloading in the background. Older messages may take a while to appear." "$ICON_INFO"
+    finish "PURGED" 0
+
+else
+    step 5 "Restore original data"
+    show_progress "Restoring your previous Outlook..." "Outlook will close and your previous data will be put back exactly as it was.
+
+Please wait and do not open Outlook."
+    quit_outlook || detail "WARNING: some Outlook processes were still running during restore."
+
+    if [[ ! -d "$BACKUP_FOLDER" ]]; then
+        # Do NOT remove the fresh profile if there is no backup to put back
+        detail "ERROR: backup folder not found. Fresh profile left in place."
+        hide_progress
+        open_outlook
+        notify "Outlook needs IT attention" "Your previous Outlook data could not be restored automatically.
+
+Please contact IT." "$ICON_STOP"
+        finish "FAILED" 1
+    fi
+
+    # Remove the fresh profile entirely so mv renames the backup instead of nesting it
+    /bin/rm -rf "$newOutlookPath"
+    if /bin/mv "$BACKUP_FOLDER" "$newOutlookPath"; then
+        /usr/sbin/chown -R "$currentUser" "$outlookRoot"
+        /bin/rmdir "$BACKUP_BASE" 2>/dev/null
+        detail "Original profile restored. Nothing was deleted."
+        hide_progress
+        open_outlook
+        notify "Your previous Outlook has been restored" "Nothing was deleted. Outlook is back exactly as it was.
+
+IT will follow up with you." "$ICON_INFO"
+        finish "RESTORED" 0
+    else
+        detail "ERROR: restore failed. Backup is still at: $BACKUP_FOLDER"
+        hide_progress
+        notify "Outlook needs IT attention" "Your data is safe, but Outlook could not be restored automatically.
+
+Please contact IT." "$ICON_STOP"
+        finish "FAILED" 1
+    fi
+fi
